@@ -44,6 +44,8 @@ public:
 		glm::vec3 normal;
 		glm::vec2 uv;
 		glm::vec3 color;
+		glm::vec4 jointIndices;
+		glm::vec4 jointWeights;
 	};
 
 	// Single vertex buffer for all primitives
@@ -78,14 +80,70 @@ public:
 	// A node represents an object in the glTF scene graph
 	struct Node {
 		Node* parent;
+		uint32_t index;
 		std::vector<Node*> children;
 		Mesh mesh;
 		glm::mat4 matrix;
+		int32_t skin = -1;
 		~Node() {
 			for (auto& child : children) {
 				delete child;
 			}
 		}
+	};
+
+	/*
+		Skin structure
+	*/
+	struct Skin
+	{
+		std::string            name;
+		Node *                 skeletonRoot = nullptr;
+		// 逆绑定矩阵，用于将模型空间中的顶点坐标转换到各个骨骼空间
+		std::vector<glm::mat4> inverseBindMatrices;
+		// 关节，其实是node
+		std::vector<Node *>    joints;
+		// shader storage buffer object，用于存储逆绑定矩阵，供GPU读取
+		vks::Buffer            ssbo;
+		// 描述符集，用于将逆绑定矩阵传递给着色器
+		VkDescriptorSet        descriptorSet;
+	};
+
+	/*
+		Animation related structures
+	*/
+
+	struct AnimationSampler
+	{
+		std::string            interpolation;
+		// 输入时间
+		std::vector<float>     inputs;
+		// 输出对应时间点的关节属性，比如位置、旋转、缩放
+		std::vector<glm::vec4> outputsVec4;
+	};
+
+	struct AnimationChannel
+	{
+		// 关节路径，比如"translation"、"rotation"、"scale"
+		std::string path;
+		// 关节
+		Node *      node;
+		// 采样器索引
+		uint32_t    samplerIndex;
+	};
+
+	struct Animation
+	{
+		// 动画名称
+		std::string                   name;
+		// 采样器
+		std::vector<AnimationSampler> samplers;
+		// 通道
+		std::vector<AnimationChannel> channels;
+		// 开始时间
+		float                         start       = std::numeric_limits<float>::max();
+		float                         end         = std::numeric_limits<float>::min();
+		float                         currentTime = 0.0f;
 	};
 
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
@@ -115,6 +173,8 @@ public:
 	std::vector<Texture> textures;
 	std::vector<Material> materials;
 	std::vector<Node*> nodes;
+	std::vector<Skin> skins;
+	std::vector<Animation> animations;
 
 	~VulkanglTFModel()
 	{
@@ -201,12 +261,12 @@ public:
 		}
 	}
 
-	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
+	void loadNode(const tinygltf::Node& inputNode, const tinygltf::Model& input, VulkanglTFModel::Node* parent, uint32_t nodeIndex, std::vector<uint32_t>& indexBuffer, std::vector<VulkanglTFModel::Vertex>& vertexBuffer)
 	{
 		VulkanglTFModel::Node* node = new VulkanglTFModel::Node{};
 		node->matrix = glm::mat4(1.0f);
 		node->parent = parent;
-
+		node->index = nodeIndex;
 		// Get the local node matrix
 		// It's either made up from translation, rotation, scale or a 4x4 matrix
 		if (inputNode.translation.size() == 3) {
@@ -226,7 +286,7 @@ public:
 		// Load node's children
 		if (inputNode.children.size() > 0) {
 			for (size_t i = 0; i < inputNode.children.size(); i++) {
-				loadNode(input.nodes[inputNode.children[i]], input , node, indexBuffer, vertexBuffer);
+				loadNode(input.nodes[inputNode.children[i]], input , node, inputNode.children[i], indexBuffer, vertexBuffer);
 			}
 		}
 
@@ -245,6 +305,9 @@ public:
 					const float* positionBuffer = nullptr;
 					const float* normalsBuffer = nullptr;
 					const float* texCoordsBuffer = nullptr;
+					const uint16_t* jointIndicesBuffer = nullptr;
+					const float* jointWeightsBuffer = nullptr;
+					bool hasSkin = false;
 					size_t vertexCount = 0;
 
 					// Get buffer data for vertex positions
@@ -267,6 +330,19 @@ public:
 						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
 						texCoordsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
 					}
+					// Get buffer data for vertex joint indices
+					if (glTFPrimitive.attributes.find("JOINTS_0") != glTFPrimitive.attributes.end()) {
+						const tinygltf::Accessor& accessor = input.accessors[glTFPrimitive.attributes.find("JOINTS_0")->second];
+						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
+						jointIndicesBuffer = reinterpret_cast<const uint16_t*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+					}
+					// Get buffer data for vertex joint weights
+					if (glTFPrimitive.attributes.find("WEIGHTS_0") != glTFPrimitive.attributes.end()) {
+						const tinygltf::Accessor& accessor = input.accessors[glTFPrimitive.attributes.find("WEIGHTS_0")->second];
+						const tinygltf::BufferView& view = input.bufferViews[accessor.bufferView];
+						jointWeightsBuffer = reinterpret_cast<const float*>(&(input.buffers[view.buffer].data[accessor.byteOffset + view.byteOffset]));
+					}
+					hasSkin = (jointIndicesBuffer && jointWeightsBuffer);
 
 					// Append data to model's vertex buffer
 					for (size_t v = 0; v < vertexCount; v++) {
@@ -275,6 +351,8 @@ public:
 						vert.normal = glm::normalize(glm::vec3(normalsBuffer ? glm::make_vec3(&normalsBuffer[v * 3]) : glm::vec3(0.0f)));
 						vert.uv = texCoordsBuffer ? glm::make_vec2(&texCoordsBuffer[v * 2]) : glm::vec3(0.0f);
 						vert.color = glm::vec3(1.0f);
+						vert.jointIndices = hasSkin ? glm::vec4(glm::make_vec4(&jointIndicesBuffer[v * 4])) : glm::vec4(0.0f);
+						vert.jointWeights = hasSkin ? glm::make_vec4(&jointWeightsBuffer[v * 4]) : glm::vec4(0.0f);
 						vertexBuffer.push_back(vert);
 					}
 				}
@@ -327,6 +405,137 @@ public:
 		}
 		else {
 			nodes.push_back(node);
+		}
+	}
+
+
+	/*
+		glTF vertex skinning functions
+	*/
+
+	// POI: Traverse the node hierarchy to the top-most parent to get the local matrix of the given node
+	glm::mat4 VulkanglTFModel::getNodeMatrix(VulkanglTFModel::Node *node)
+	{
+		glm::mat4              nodeMatrix    = node->matrix;
+		VulkanglTFModel::Node *currentParent = node->parent;
+		while (currentParent)
+		{
+			nodeMatrix    = currentParent->matrix * nodeMatrix;
+			currentParent = currentParent->parent;
+		}
+		return nodeMatrix;
+	}
+
+	// POI: Update the joint matrices from the current animation frame and pass them to the GPU
+	void VulkanglTFModel::updateJoints(VulkanglTFModel::Node *node)
+	{
+		// 如果节点有skin，则更新关节矩阵
+		if (node->skin > -1)
+		{
+			// 更新关节矩阵
+			glm::mat4              inverseTransform = glm::inverse(getNodeMatrix(node));
+			Skin                   skin             = skins[node->skin];
+			size_t                 numJoints        = (uint32_t) skin.joints.size();
+			std::vector<glm::mat4> jointMatrices(numJoints);
+			for (size_t i = 0; i < numJoints; i++)
+			{
+				// 使用逆绑定矩阵将顶点坐标从模型空间转换到对应绑定关节的局部空间，然后使用关节矩阵将顶点坐标转换到世界空间
+				jointMatrices[i] = getNodeMatrix(skin.joints[i]) * skin.inverseBindMatrices[i];
+				// 使用逆变换矩阵将顶点坐标从世界空间转换到mesh模型空间，因为我们后面MVP矩阵是使用mesh模型空间计算的
+				jointMatrices[i] = inverseTransform * jointMatrices[i];
+			}
+			// Update ssbo
+			skin.ssbo.copyTo(jointMatrices.data(), jointMatrices.size() * sizeof(glm::mat4));
+		}
+
+		for (auto &child : node->children)
+		{
+			updateJoints(child);
+		}
+	}
+
+	// Helper functions for locating glTF nodes
+
+	VulkanglTFModel::Node *VulkanglTFModel::findNode(Node *parent, uint32_t index)
+	{
+		Node *nodeFound = nullptr;
+		if (parent->index == index)
+		{
+			return parent;
+		}
+		for (auto &child : parent->children)
+		{
+			nodeFound = findNode(child, index);
+			if (nodeFound)
+			{
+				break;
+			}
+		}
+		return nodeFound;
+	}
+
+	VulkanglTFModel::Node *VulkanglTFModel::nodeFromIndex(uint32_t index)
+	{
+		Node *nodeFound = nullptr;
+		for (auto &node : nodes)
+		{
+			nodeFound = findNode(node, index);
+			if (nodeFound)
+			{
+				break;
+			}
+		}
+		return nodeFound;
+	}
+
+	void loadSkins(tinygltf::Model& input)
+	{
+		skins.resize(input.skins.size());
+
+		for (size_t i = 0; i < input.skins.size(); i++)
+		{
+			tinygltf::Skin glTFSkin = input.skins[i];
+
+			skins[i].name = glTFSkin.name;
+			// Find the root node of the skeleton
+			skins[i].skeletonRoot = nodeFromIndex(glTFSkin.skeleton);
+
+			// Find joint nodes
+			for (int jointIndex : glTFSkin.joints)
+			{
+				Node *node = nodeFromIndex(jointIndex);
+				if (node)
+				{
+					skins[i].joints.push_back(node);
+				}
+			}
+
+			// Get the inverse bind matrices from the buffer associated to this skin
+			if (glTFSkin.inverseBindMatrices > -1)
+			{
+				const tinygltf::Accessor &  accessor   = input.accessors[glTFSkin.inverseBindMatrices];
+				const tinygltf::BufferView &bufferView = input.bufferViews[accessor.bufferView];
+				const tinygltf::Buffer &    buffer     = input.buffers[bufferView.buffer];
+				skins[i].inverseBindMatrices.resize(accessor.count);
+				memcpy(skins[i].inverseBindMatrices.data(), &buffer.data[accessor.byteOffset + bufferView.byteOffset], accessor.count * sizeof(glm::mat4));
+
+				// Store inverse bind matrices for this skin in a shader storage buffer object
+				// To keep this sample simple, we create a host visible shader storage buffer
+				VK_CHECK_RESULT(vulkanDevice->createBuffer(
+					VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+					VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+					&skins[i].ssbo,
+					sizeof(glm::mat4) * skins[i].inverseBindMatrices.size(),
+					skins[i].inverseBindMatrices.data()));
+				VK_CHECK_RESULT(skins[i].ssbo.map());
+			}
+		}
+	}
+	void loadAnimations(tinygltf::Model& input)
+	{
+		animations.resize(input.animations.size());
+		for (size_t i = 0; i < input.animations.size(); i++) {
+			animations[i].name = input.animations[i].name;
 		}
 	}
 
@@ -509,7 +718,14 @@ public:
 			const tinygltf::Scene& scene = glTFInput.scenes[0];
 			for (size_t i = 0; i < scene.nodes.size(); i++) {
 				const tinygltf::Node node = glTFInput.nodes[scene.nodes[i]];
-				glTFModel.loadNode(node, glTFInput, nullptr, indexBuffer, vertexBuffer);
+				glTFModel.loadNode(node, glTFInput, nullptr, scene.nodes[i], indexBuffer, vertexBuffer);
+			}
+			glTFModel.loadSkins(glTFInput);
+			glTFModel.loadAnimations(glTFInput);
+			// Calculate initial pose
+			for (auto node : glTFModel.nodes)
+			{
+				glTFModel.updateJoints(node);
 			}
 		}
 		else {
