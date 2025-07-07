@@ -1,0 +1,16 @@
+{
+    "files.associations": {
+        "*.h": "cpp",
+        "*.fs": "glsl",
+        "xstring": "cpp",
+        "utility": "cpp",
+        "limits": "cpp",
+        "chrono": "cpp",
+        "ranges": "cpp",
+        "vector": "cpp",
+        "algorithm": "cpp",
+        "random": "cpp",
+        "valarray": "cpp",
+        "xutility": "cpp"
+    }
+}
