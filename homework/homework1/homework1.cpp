@@ -170,15 +170,23 @@ public:
 	// A glTF material stores information in e.g. the texture that is attached to it and colors
 	struct Material {
 		glm::vec4 baseColorFactor = glm::vec4(1.0f);
-		uint32_t baseColorTextureIndex;
+		uint32_t baseColorTextureIndex = 0;
+		uint32_t normalTextureIndex = 0;
+		uint32_t metallicRoughnessTextureIndex = 0;
+		uint32_t occlusionTextureIndex = 0;
+		uint32_t emissiveTextureIndex = 0;
+		glm::vec3 emissiveFactor = glm::vec3(0.0f);
+		std::string alphaMode = "OPAQUE";
+		float alphaCutoff = 0.5f;
+		bool doubleSided = false;
+		// We also store (and create) a descriptor set that's used to access this material's textures from the fragment shader
+		VkDescriptorSet descriptorSet;
 	};
 
 	// Contains the texture for a single glTF image
 	// Images may be reused by texture objects and are as such separated
 	struct Image {
 		vks::Texture2D texture;
-		// We also store (and create) a descriptor set that's used to access this texture from the fragment shader
-		VkDescriptorSet descriptorSet;
 	};
 
 	// A glTF texture stores a reference to the image and a sampler
@@ -276,7 +284,7 @@ public:
 	{
 		materials.resize(input.materials.size());
 		for (size_t i = 0; i < input.materials.size(); i++) {
-			// We only read the most basic properties required for our sample
+			// We get PBR material, load all the textures
 			tinygltf::Material glTFMaterial = input.materials[i];
 			// Get the base color factor
 			if (glTFMaterial.values.find("baseColorFactor") != glTFMaterial.values.end()) {
@@ -286,6 +294,31 @@ public:
 			if (glTFMaterial.values.find("baseColorTexture") != glTFMaterial.values.end()) {
 				materials[i].baseColorTextureIndex = glTFMaterial.values["baseColorTexture"].TextureIndex();
 			}
+			if (glTFMaterial.values.find("normalTexture") != glTFMaterial.values.end()) {
+				materials[i].normalTextureIndex = glTFMaterial.values["normalTexture"].TextureIndex();
+			}
+			if (glTFMaterial.values.find("metallicRoughnessTexture") != glTFMaterial.values.end()) {
+				materials[i].metallicRoughnessTextureIndex = glTFMaterial.values["metallicRoughnessTexture"].TextureIndex();
+			}
+			if (glTFMaterial.values.find("occlusionTexture") != glTFMaterial.values.end()) {
+				materials[i].occlusionTextureIndex = glTFMaterial.values["occlusionTexture"].TextureIndex();
+			}
+			if (glTFMaterial.values.find("emissiveTexture") != glTFMaterial.values.end()) {
+				materials[i].emissiveTextureIndex = glTFMaterial.values["emissiveTexture"].TextureIndex();
+			}
+			if (glTFMaterial.values.find("alphaMode") != glTFMaterial.values.end()) {
+				materials[i].alphaMode = glTFMaterial.values["alphaMode"].string_value;
+			}
+			if (glTFMaterial.values.find("alphaCutoff") != glTFMaterial.values.end()) {
+				materials[i].alphaCutoff = glTFMaterial.values["alphaCutoff"].number_value;
+			}
+			if (glTFMaterial.values.find("doubleSided") != glTFMaterial.values.end()) {
+				materials[i].doubleSided = glTFMaterial.values["doubleSided"].bool_value;
+			}
+			if (glTFMaterial.values.find("emissiveFactor") != glTFMaterial.values.end()) {
+				materials[i].emissiveFactor = glm::make_vec3(glTFMaterial.values["emissiveFactor"].ColorFactor().data());
+			}
+
 		}
 	}
 
@@ -761,10 +794,9 @@ void VulkanglTFModel::updateAnimation(float deltaTime)
 			
 			for (VulkanglTFModel::Primitive& primitive : node->mesh.primitives) {
 				if (primitive.indexCount > 0) {
-					// Get the texture index for this primitive
-					VulkanglTFModel::Texture texture = textures[materials[primitive.materialIndex].baseColorTextureIndex];
-					// Bind the descriptor for the current primitive's texture (set 2)
-					vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1, &images[texture.imageIndex].descriptorSet, 0, nullptr);
+									// Bind the descriptor for the current primitive's material (set 2)
+				vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 2, 1, &materials[primitive.materialIndex].descriptorSet, 0, nullptr);
+
 					vkCmdDrawIndexed(commandBuffer, primitive.indexCount, 1, primitive.firstIndex, 0, 0);
 				}
 			}
@@ -1027,13 +1059,13 @@ public:
 
 		std::vector<VkDescriptorPoolSize> poolSizes = {
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1),
-			// One combined image sampler per model image/texture
-			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.images.size())),
+			// Five combined image samplers per material (baseColor, normal, metallicRoughness, occlusion, emissive)
+			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, static_cast<uint32_t>(glTFModel.materials.size()) * 5),
 			// One storage buffer for animation transforms
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1),
 		};
-		// One set for matrices, one for animation transforms, and one per model image/texture
-		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.images.size()) + 2;
+		// One set for matrices, one for animation transforms, and one per material
+		const uint32_t maxSetCount = static_cast<uint32_t>(glTFModel.materials.size()) + 2;
 		VkDescriptorPoolCreateInfo descriptorPoolInfo = vks::initializers::descriptorPoolCreateInfo(poolSizes, maxSetCount);
 		VK_CHECK_RESULT(vkCreateDescriptorPool(device, &descriptorPoolInfo, nullptr, &descriptorPool));
 
@@ -1041,9 +1073,16 @@ public:
 		VkDescriptorSetLayoutBinding setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
 		VkDescriptorSetLayoutCreateInfo descriptorSetLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(&setLayoutBinding, 1);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.matrices));
-		// Descriptor set layout for passing material textures
-		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0);
-		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.textures));
+		// Descriptor set layout for passing material textures (5 bindings: baseColor, normal, metallicRoughness, occlusion, emissive)
+		std::vector<VkDescriptorSetLayoutBinding> textureLayoutBindings = {
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 0), // baseColor
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 1), // normal
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 2), // metallicRoughness
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 3), // occlusion
+			vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_SHADER_STAGE_FRAGMENT_BIT, 4)  // emissive
+		};
+		VkDescriptorSetLayoutCreateInfo textureLayoutCI = vks::initializers::descriptorSetLayoutCreateInfo(textureLayoutBindings.data(), static_cast<uint32_t>(textureLayoutBindings.size()));
+		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &textureLayoutCI, nullptr, &descriptorSetLayouts.textures));
 		// Descriptor set layout for passing skin joint matrices
 		setLayoutBinding = vks::initializers::descriptorSetLayoutBinding(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_SHADER_STAGE_VERTEX_BIT, 0);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &descriptorSetLayoutCI, nullptr, &descriptorSetLayouts.jointMatrices));
@@ -1059,11 +1098,80 @@ public:
 		VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(descriptorSet, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &shaderData.buffer.descriptor);
 		vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
 		// Descriptor sets for materials
-		for (auto& image : glTFModel.images) {
+		for (auto& material : glTFModel.materials) {
 			const VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayouts.textures, 1);
-			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &image.descriptorSet));
-			VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(image.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &image.texture.descriptor);
-			vkUpdateDescriptorSets(device, 1, &writeDescriptorSet, 0, nullptr);
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &material.descriptorSet));
+			
+			// 准备所有纹理的描述符更新
+			std::vector<VkWriteDescriptorSet> writeDescriptorSets;
+			
+			// 为每个binding准备默认纹理（使用第一个纹理作为fallback）
+			VkDescriptorImageInfo* defaultImageInfo = glTFModel.images.empty() ? nullptr : &glTFModel.images[0].texture.descriptor;
+			
+			// Binding 0: BaseColor
+			if (material.baseColorTextureIndex < glTFModel.textures.size()) {
+				VulkanglTFModel::Texture texture = glTFModel.textures[material.baseColorTextureIndex];
+				if (texture.imageIndex < glTFModel.images.size()) {
+					VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &glTFModel.images[texture.imageIndex].texture.descriptor);
+					writeDescriptorSets.push_back(writeDescriptorSet);
+				}
+			} else if (defaultImageInfo) {
+				VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, defaultImageInfo);
+				writeDescriptorSets.push_back(writeDescriptorSet);
+			}
+			
+			// Binding 1: Normal
+			if (material.normalTextureIndex < glTFModel.textures.size()) {
+				VulkanglTFModel::Texture texture = glTFModel.textures[material.normalTextureIndex];
+				if (texture.imageIndex < glTFModel.images.size()) {
+					VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, &glTFModel.images[texture.imageIndex].texture.descriptor);
+					writeDescriptorSets.push_back(writeDescriptorSet);
+				}
+			} else if (defaultImageInfo) {
+				VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, defaultImageInfo);
+				writeDescriptorSets.push_back(writeDescriptorSet);
+			}
+			
+			// Binding 2: MetallicRoughness
+			if (material.metallicRoughnessTextureIndex < glTFModel.textures.size()) {
+				VulkanglTFModel::Texture texture = glTFModel.textures[material.metallicRoughnessTextureIndex];
+				if (texture.imageIndex < glTFModel.images.size()) {
+					VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2, &glTFModel.images[texture.imageIndex].texture.descriptor);
+					writeDescriptorSets.push_back(writeDescriptorSet);
+				}
+			} else if (defaultImageInfo) {
+				VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2, defaultImageInfo);
+				writeDescriptorSets.push_back(writeDescriptorSet);
+			}
+			
+			// Binding 3: Occlusion
+			if (material.occlusionTextureIndex < glTFModel.textures.size()) {
+				VulkanglTFModel::Texture texture = glTFModel.textures[material.occlusionTextureIndex];
+				if (texture.imageIndex < glTFModel.images.size()) {
+					VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3, &glTFModel.images[texture.imageIndex].texture.descriptor);
+					writeDescriptorSets.push_back(writeDescriptorSet);
+				}
+			} else if (defaultImageInfo) {
+				VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3, defaultImageInfo);
+				writeDescriptorSets.push_back(writeDescriptorSet);
+			}
+			
+			// Binding 4: Emissive
+			if (material.emissiveTextureIndex < glTFModel.textures.size()) {
+				VulkanglTFModel::Texture texture = glTFModel.textures[material.emissiveTextureIndex];
+				if (texture.imageIndex < glTFModel.images.size()) {
+					VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, &glTFModel.images[texture.imageIndex].texture.descriptor);
+					writeDescriptorSets.push_back(writeDescriptorSet);
+				}
+			} else if (defaultImageInfo) {
+				VkWriteDescriptorSet writeDescriptorSet = vks::initializers::writeDescriptorSet(material.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4, defaultImageInfo);
+				writeDescriptorSets.push_back(writeDescriptorSet);
+			}
+			
+			// 批量更新所有描述符
+			if (!writeDescriptorSets.empty()) {
+				vkUpdateDescriptorSets(device, static_cast<uint32_t>(writeDescriptorSets.size()), writeDescriptorSets.data(), 0, nullptr);
+			}
 		}
 
 		// Descriptor sets for animation transforms

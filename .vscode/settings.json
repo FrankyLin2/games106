@@ -11,6 +11,7 @@
         "algorithm": "cpp",
         "random": "cpp",
         "valarray": "cpp",
-        "xutility": "cpp"
+        "xutility": "cpp",
+        "xtree": "cpp"
     }
 }
